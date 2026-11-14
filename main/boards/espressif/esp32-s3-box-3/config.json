@@ -6,7 +6,9 @@
         {
             "name": "esp-box-3",
             "sdkconfig_append": [
-                "CONFIG_USE_DEVICE_AEC=y"
+                "CONFIG_USE_DEVICE_AEC=y",
+                "CONFIG_KEYWORD_ONLY_TURNS=y",
+                "CONFIG_SEND_WAKE_WORD_DATA=n"
             ]
         }
     ]

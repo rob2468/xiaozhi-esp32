@@ -233,6 +233,11 @@ void Application::Run() {
         }
 
         if (bits & MAIN_EVENT_PLAYBACK_DRAINED) {
+#if CONFIG_KEYWORD_ONLY_TURNS
+            if (keyword_turn_.FinishPlayback(audio_service_.IsPlaybackIdle())) {
+                SetDeviceState(kDeviceStateIdle);
+            }
+#endif
             if (audio_service_.IsPlaybackIdle()) {
                 notify_player_.OnPlaybackDrained();
             }
@@ -263,6 +268,11 @@ void Application::Run() {
 
         if (bits & MAIN_EVENT_SEND_AUDIO) {
             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
+#if CONFIG_KEYWORD_ONLY_TURNS
+                if (!keyword_turn_.IsListening() || GetDeviceState() != kDeviceStateListening) {
+                    continue;
+                }
+#endif
                 if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
                     // Drop the remaining packets. Leaving them in the queue would
                     // stall the Opus codec task (it waits for queue space), which in
@@ -662,17 +672,30 @@ void Application::InitializeProtocol() {
             }
             if (strcmp(state->valuestring, "start") == 0) {
                 Schedule([this]() {
+#if CONFIG_KEYWORD_ONLY_TURNS
+                    // Ignore unsolicited greetings, late starts after abort, and duplicate starts.
+                    if (!keyword_turn_.StartReply()) {
+                        return;
+                    }
+#endif
                     aborted_ = false;
                     SetDeviceState(kDeviceStateSpeaking);
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
                 Schedule([this]() {
                     if (GetDeviceState() == kDeviceStateSpeaking) {
+#if CONFIG_KEYWORD_ONLY_TURNS
+                        keyword_turn_.StopReply();
+                        if (keyword_turn_.FinishPlayback(audio_service_.IsPlaybackIdle())) {
+                            SetDeviceState(kDeviceStateIdle);
+                        }
+#else
                         if (listening_mode_ == kListeningModeManualStop) {
                             SetDeviceState(kDeviceStateIdle);
                         } else {
                             SetDeviceState(kDeviceStateListening);
                         }
+#endif
                     }
                 });
             } else if (strcmp(state->valuestring, "sentence_start") == 0) {
@@ -684,8 +707,12 @@ void Application::InitializeProtocol() {
                         glyphs.clear();
                     }
                     ESP_LOGI(TAG, "<< %s", text->valuestring);
-                    Schedule([display, message = std::string(text->valuestring),
+                    Schedule([this, display, message = std::string(text->valuestring),
                               glyphs = std::move(glyphs), bpp]() {
+#if CONFIG_KEYWORD_ONLY_TURNS
+                        if (GetDeviceState() != kDeviceStateSpeaking)
+                            return;
+#endif
                         display->AddTextGlyphs(glyphs, bpp);
                         display->SetChatMessage("assistant", message.c_str());
                     });
@@ -700,8 +727,14 @@ void Application::InitializeProtocol() {
                     glyphs.clear();
                 }
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
-                Schedule([display, message = std::string(text->valuestring),
+                Schedule([this, display, message = std::string(text->valuestring),
                           glyphs = std::move(glyphs), bpp]() {
+#if CONFIG_KEYWORD_ONLY_TURNS
+                    if (message.empty() || !keyword_turn_.AcceptTranscript())
+                        return;
+                    audio_service_.EnableVoiceProcessing(false);
+                    audio_service_.EnableWakeWordDetection(true);
+#endif
                     display->AddTextGlyphs(glyphs, bpp);
                     display->SetChatMessage("user", message.c_str());
                 });
@@ -817,6 +850,11 @@ void Application::StopListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_
 
 void Application::HandleToggleChatEvent() {
     auto state = GetDeviceState();
+#if CONFIG_KEYWORD_ONLY_TURNS
+    if (state == kDeviceStateIdle || state == kDeviceStateConnecting ||
+        state == kDeviceStateListening || state == kDeviceStateSpeaking)
+        return;
+#endif
 
     if (state == kDeviceStateNotifying) {
         StopNotification();
@@ -881,6 +919,11 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
 
 void Application::HandleStartListeningEvent() {
     auto state = GetDeviceState();
+#if CONFIG_KEYWORD_ONLY_TURNS
+    if (state == kDeviceStateIdle || state == kDeviceStateConnecting ||
+        state == kDeviceStateListening || state == kDeviceStateSpeaking)
+        return;
+#endif
 
     if (state == kDeviceStateNotifying) {
         StopNotification();
@@ -917,6 +960,10 @@ void Application::HandleStartListeningEvent() {
 
 void Application::HandleStopListeningEvent() {
     auto state = GetDeviceState();
+#if CONFIG_KEYWORD_ONLY_TURNS
+    if (state == kDeviceStateListening || state == kDeviceStateSpeaking)
+        return;
+#endif
 
     if (state == kDeviceStateNotifying) {
         StopNotification();
@@ -948,16 +995,26 @@ void Application::HandleWakeWordDetectedEvent() {
         BeginWakeWordInvoke(wake_word);
     } else if (state == kDeviceStateSpeaking || state == kDeviceStateListening) {
         AbortSpeaking(kAbortReasonWakeWordDetected);
+#if CONFIG_KEYWORD_ONLY_TURNS
+        keyword_turn_.Wake();
+        audio_service_.EnableVoiceProcessing(false);
+        audio_service_.ResetDecoder();
+#endif
         // Clear send queue to avoid sending residues to server
         while (audio_service_.PopPacketFromSendQueue())
             ;
 
         if (state == kDeviceStateListening) {
+#if CONFIG_KEYWORD_ONLY_TURNS
+            play_popup_on_listening_ = true;
+            StartListeningAudio();
+#else
             protocol_->SendStartListening(GetDefaultListeningMode());
             audio_service_.ResetDecoder();
             audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
             // Re-enable wake word detection as it was stopped by the detection itself
             audio_service_.EnableWakeWordDetection(true);
+#endif
         } else {
             // Play popup sound and start listening again
             play_popup_on_listening_ = true;
@@ -970,6 +1027,9 @@ void Application::HandleWakeWordDetectedEvent() {
 }
 
 void Application::BeginWakeWordInvoke(const std::string& wake_word) {
+#if CONFIG_KEYWORD_ONLY_TURNS
+    keyword_turn_.Wake();
+#endif
     // Must run in the main task with the device in idle state
     audio_service_.EncodeWakeWord();
 
@@ -1045,6 +1105,9 @@ void Application::HandleStateChangedEvent() {
     switch (new_state) {
         case kDeviceStateUnknown:
         case kDeviceStateIdle:
+#if CONFIG_KEYWORD_ONLY_TURNS
+            keyword_turn_.Reset();
+#endif
             // Keep a just-raised network error visible. SetDeviceState(idle)
             // queues STATE_CHANGED after Alert(), and the idle handler would
             // otherwise wipe the status, emotion, and chat message.
@@ -1195,7 +1258,7 @@ void Application::StartListeningAudio() {
 }
 
 void Application::ConfigureWakeWordForListening() {
-#ifdef CONFIG_WAKE_WORD_DETECTION_IN_LISTENING
+#if defined(CONFIG_WAKE_WORD_DETECTION_IN_LISTENING) || CONFIG_KEYWORD_ONLY_TURNS
     // Enable wake word detection in listening mode (configured via Kconfig)
     audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
 #else
@@ -1292,7 +1355,11 @@ void Application::SetListeningMode(ListeningMode mode) {
 }
 
 ListeningMode Application::GetDefaultListeningMode() const {
+#if CONFIG_KEYWORD_ONLY_TURNS
+    return kListeningModeAutoStop;
+#else
     return aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime;
+#endif
 }
 
 void Application::Reboot() {
